@@ -133,3 +133,30 @@ def worker_init_fn(worker_id, num_workers, rank, seed):
     worker_seed = num_workers * rank + worker_id + seed
     np.random.seed(worker_seed)
     random.seed(worker_seed)
+
+
+def build_tianchi_dataloader(dataset,
+                             samples_per_gpu,
+                             num_gpus=1,
+                             dist=True,
+                             shuffle=True,
+                             seed=None):
+    rank, world_size = get_dist_info()
+    if dist:
+        sampler = DistributedSampler(
+            dataset, world_size, rank, shuffle=shuffle)
+        batch_size = samples_per_gpu
+    else:
+        from torch.utils.data import RandomSampler
+        sampler = RandomSampler(dataset) if shuffle else None
+        batch_size = samples_per_gpu * num_gpus
+
+    data_loader = DataLoader(
+        dataset,
+        batch_size=batch_size,
+        sampler=sampler,
+        num_workers=0,
+        pin_memory=False,
+        collate_fn=partial(collate, samples_per_gpu=samples_per_gpu))
+
+    return data_loader
