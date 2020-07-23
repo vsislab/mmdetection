@@ -93,15 +93,17 @@ class Study(object):
 
     def _get_label(self, label, classes):
         labels = label.split(',')
+
         if len(labels) == 1:
-            label = labels[0][-1]
+            if label == '':
+                label = 1
+            else:
+                label = labels[0][-1]
         elif len(labels) == 2:
             # DISC parts may have multi-labels, ``vX1, vX2``
             # choose the first one
             label = labels[0][-1]
-        else:
-            assert label == ''
-            label = 1
+
         return int(label)
 
     def load_annotation(self, annotation):
