@@ -33,7 +33,7 @@ class Study(object):
     VERTEBRA_PARTS = ('L1', 'L2', 'L3', 'L4', 'L5')
     VERTEBRA_CLASSES = ('v1', 'v2')
 
-    def __init__(self, path, num_processes=12):
+    def __init__(self, path, num_processes=4):
         # get all DICOMs
         dicoms = glob(osp.join(path, '*.dcm'))
         if num_processes > 0:
@@ -105,37 +105,6 @@ class Study(object):
             label = labels[0][-1]
 
         return int(label)
-
-    def load_annotation(self, annotation):
-        points = annotation['point']
-
-        valid = np.zeros((len(self.PARTS), ), dtype=np.int64)
-        gt_points = np.zeros((len(self.PARTS), 2), dtype=np.float32)
-        gt_labels = np.zeros((len(self.PARTS), 2), dtype=np.int64)
-
-        for i, point in enumerate(points):
-            part = point['tag']['identification']
-            # some points are not of these parts ``T12-L1`` - ``L5-S1``
-            if part not in self.PARTS:
-                continue
-            part_idx = self.PARTS.index(part)
-
-            valid[part_idx] = 1
-            gt_points[part_idx, :] = point['coord']
-            if part in self.DISC_PARTS:
-                # disc
-                label = point['tag']['disc']
-                label = self._get_label(label, self.DISC_CLASSES)
-                gt_labels[part_idx, 0] = label
-            elif part in self.VERTEBRA_PARTS:
-                # vertebra
-                label = point['tag']['vertebra']
-                label = self._get_label(label, self.VERTEBRA_CLASSES)
-                gt_labels[part_idx, 1] = label
-
-        ann = dict(valid=valid, gt_points=gt_points, gt_labels=gt_labels)
-
-        return ann
 
     def visualization(self, out_dir='work_dirs/visualizations'):
         for dicom in self.dicoms:

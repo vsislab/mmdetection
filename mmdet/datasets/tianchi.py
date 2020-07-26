@@ -1,115 +1,193 @@
-import math
-import os.path as osp
+import copy
+import time
+from collections import defaultdict
 
 import mmcv
 import numpy as np
 
-from mmdet.core import Study
 from .builder import DATASETS
-from .pipelines import Compose
+from .coco import CocoDataset
 
-study_uid2study_idx = mmcv.load('mmdet/core/structure/study_uids.json')
+
+class Tianchi:
+
+    def __init__(self, annotation_file=None):
+        # load dataset
+        self.dataset = dict()
+        self.anns = dict()
+        self.cats = dict()
+        self.studies, self.dicoms = dict(), dict()
+
+        self.study_uid_id_map = dict()
+        self.dicom_uid_id_map = dict()
+        self.study_to_anns = defaultdict(list)
+        self.study_to_dicoms = defaultdict(list)
+        if annotation_file is not None:
+            print('loading annotations into memory...')
+            tic = time.time()
+            dataset = mmcv.load(annotation_file)
+            assert type(
+                dataset
+            ) == dict, f'annotation file format {type(dataset)} not supported'
+            print('Done (t={:0.2f}s)'.format(time.time() - tic))
+            self.dataset = dataset
+            self.creatIndex()
+
+    def creatIndex(self):
+        # create index
+        print('creating index...')
+        anns, cats, studies, dicoms = {}, {}, {}, {}
+        study_uid_id_map = {}
+        dicom_uid_id_map = {}
+        study_to_anns = defaultdict(list)
+        study_to_dicoms = defaultdict(list)
+
+        # without ground truths, dataset always have "studies" and "dicoms"
+        # but there are no "series_uid" and "instance_uid" in study
+        if 'studies' in self.dataset:
+            for study in self.dataset['studies']:
+                studies[study['id']] = study
+                study_uid_id_map[study['study_uid']] = study['id']
+
+        if 'dicoms' in self.dataset:
+            for dicom in self.dataset['dicoms']:
+                dicoms[dicom['id']] = dicom
+                dicom_uid_id_map[dicom['instance_uid']] = dicom['id']
+
+        if 'dicoms' in self.dataset and 'studies' in self.dataset:
+            for dicom in self.dataset['dicoms']:
+                study_to_dicoms[study_uid_id_map[dicom['study_uid']]].append(
+                    dicom)
+
+        if 'annotations' in self.dataset:
+            for ann in self.dataset['annotations']:
+                study_to_anns[ann['study_id']].append(ann)
+                anns[ann['id']] = ann
+
+        if 'categories' in self.dataset:
+            for cat in self.dataset['categories']:
+                cats[cat['id']] = cat
+
+        print('index created!')
+
+        # create class members
+        self.anns = anns
+        self.cats = cats
+        self.studies = studies
+        self.dicoms = dicoms
+        self.study_uid_id_map = study_uid_id_map
+        self.dicom_uid_id_map = dicom_uid_id_map
+        self.study_to_anns = study_to_anns
+        self.study_to_dicoms = study_to_dicoms
+
+    def get_cat_ids(self):
+        """Returns all category ids."""
+        # return [cat['id'] for cat in self.dataset['categories']]
+        return list(self.cats.keys())
+
+    def get_study_ids(self):
+        """Returns all study ids."""
+        return list(self.studies.keys())
+
+    def get_dicom_ids(self, study_id=None):
+        """Get dicom ids that satisfy given filter conditions.
+
+        Args:
+            study_id: get dicoms for given study id.
+
+        Returns:
+            ids: integer list of dicom ids.
+        """
+        if study_id is None:
+            return list(self.dicoms.keys())
+        else:
+            dicoms = self.study_to_dicoms[study_id]
+            return [dicom['id'] for dicom in dicoms]
+
+    def get_ann_ids(self, study_id):
+        anns = self.study_to_anns[study_id]
+        ann_ids = [ann['id'] for ann in anns]
+        return ann_ids
+
+    def load_study(self, study_id):
+        return self.studies[study_id]
+
+    def load_dicoms(self, ids=[]):
+        if type(ids) == int:
+            ids = [ids]
+        return [self.dicoms[_id] for _id in ids]
+
+    def load_anns(self, ids=[]):
+        if type(ids) == int:
+            ids = [ids]
+        return [self.anns[_id] for _id in ids]
 
 
 @DATASETS.register_module()
-class TianchiDataset(object):
-
-    def __init__(self,
-                 img_prefix,
-                 pipeline,
-                 ann_file=None,
-                 data_root=None,
-                 num_frames=4,
-                 workers_per_gpu=8,
-                 test_mode=False):
-        self.ann_file = ann_file
-        self.data_root = data_root
-        self.img_prefix = img_prefix
-
-        # join paths if data_root is specified
-        if self.data_root is not None:
-            if not (self.ann_file is None or osp.isabs(self.ann_file)):
-                self.ann_file = osp.join(self.data_root, self.ann_file)
-            if not (self.img_prefix is None or osp.isabs(self.img_prefix)):
-                self.img_prefix = osp.join(self.data_root, self.img_prefix)
-
-        self.num_frames = num_frames
-        self.workers_per_gpu = workers_per_gpu
-        self.test_mode = test_mode
-
-        if not self.test_mode:
-            self.data_infos = self.load_annotations(self.ann_file)
-        else:
-            raise NotImplementedError
-
-        # processing pipeline
-        self.pipeline = Compose(pipeline)
+class TianchiImageDataset(CocoDataset):
+    CLASSES = (('disc', 'v1'), ('disc', 'v2'), ('disc', 'v3'), ('disc', 'v4'),
+               ('disc', 'v5'), ('vertebra', 'v1'), ('vertebra', 'v2'))
+    PARTS = ('T12-L1', 'L1', 'L1-L2', 'L2', 'L2-L3', 'L3', 'L3-L4', 'L4',
+             'L4-L5', 'L5', 'L5-S1')
 
     def load_annotations(self, ann_file):
-        return mmcv.load(ann_file)
 
-    def __len__(self):
-        return len(self.data_infos)
+        self.tianchi = Tianchi(ann_file)
+        self.cat_ids = self.tianchi.get_cat_ids()
+        self.cat2label = {cat_id: i for i, cat_id in enumerate(self.cat_ids)}
+        self.study_ids = self.tianchi.get_study_ids()
 
-    def _rand_another(self, idx):
-        return np.random.randint(len(self))
+        data_infos = []
+        for study_id in self.study_ids:
+            info = self.tianchi.load_study(study_id)
+            # load dicom info
+            dicom_id = self.tianchi.dicom_uid_id_map[info['instance_uid']]
+            dicom_info = copy.deepcopy(self.tianchi.load_dicoms(dicom_id)[0])
+            dicom_id = dicom_info.pop('id')
+            dicom_info['dicom_id'] = dicom_id
+            info.update(dicom_info)
+            data_infos.append(info)
+        return data_infos
 
-    def __getitem__(self, idx):
-        if self.test_mode:
-            return self.prepare_test_study(idx)
-        while True:
-            data = self.prepare_train_study(idx)
-            if data is None:
-                idx = self._rand_another(idx)
+    def _filter_imgs(self, min_size=32):
+        """Filter images too small."""
+        valid_inds = []
+        for i, data_info in enumerate(self.data_infos):
+            if min(data_info['width'], data_info['height']) >= min_size:
+                valid_inds.append(i)
+        return valid_inds
+
+    def get_ann_info(self, idx):
+        study_id = self.data_infos[idx]['id']
+        ann_ids = self.tianchi.get_ann_ids(study_id)
+        ann_info = self.tianchi.load_anns(ann_ids)
+
+        return self._parse_ann_info(ann_info)
+
+    def _parse_ann_info(self, ann_info):
+        gt_points = np.zeros((len(self.PARTS), 2), dtype=np.int64)
+        gt_labels = np.zeros((len(self.PARTS), ), dtype=np.int64)
+        valid = np.zeros((len(self.PARTS), ), dtype=np.int64)
+
+        for i, ann in enumerate(ann_info):
+            if ann['identification'] not in self.PARTS:
                 continue
-            return data
+            idx = self.PARTS.index(ann['identification'])
+            gt_points[idx] = ann['point']
+            gt_labels[idx] = self.cat2label[ann['category_id']]
+            valid[idx] = 1
 
-    def get_ann_info(self, study, data_info):
-        """Get annotation for training, by calling study.load_annotation().
-        See ``mmdet/core/structure/study.py``
-        """
-        annotation = data_info['data'][0]['annotation'][0]['data']
-        ann = study.load_annotation(annotation)
+        ann = dict(points=gt_points, labels=gt_labels, valid=valid)
 
         return ann
 
-    def prepare_train_study(self, idx):
+    def prepare_train_img(self, idx):
         data_info = self.data_infos[idx]
+        ann_info = self.get_ann_info(idx)
+        results = dict(img_info=data_info, ann_info=ann_info)
+        # self.pre_pipeline(results)
+        # return self.pipeline(results)
+        return results
 
-        study_uid = data_info['studyUid']
-        study_idx = study_uid2study_idx[study_uid]
-        study = Study(
-            osp.join(self.img_prefix, study_idx),
-            num_processes=self.workers_per_gpu)
-
-        # use the ``seriesUid``-specified Series (should be T2 & SAG)
-        series_uid = data_info['data'][0]['seriesUid']
-        series = study.series_dict[series_uid]
-        if len(series) < self.num_frames:
-            raise ValueError(f'There are only {len(series)} frames in series, '
-                             f'but {self.num_frames} needed')
-
-        # set the mid frame of series based on ``instanceUid``
-        mid_frame_idx = series.set_mid_frame(
-            data_info['data'][0]['instanceUid'])
-        # get num_frames DICOM images around the mid_frame_idx
-        n_before = math.ceil(self.num_frames / 2.)
-        # the last not included
-        n_after = int(self.num_frames - n_before)
-        # return list of dicoms
-        dicom = series[mid_frame_idx - n_before:mid_frame_idx + n_after]
-        gt_idx = n_before
-
-        ann_info = self.get_ann_info(study, data_info)
-
-        results = dict(
-            study=study,
-            series=series,
-            dicom=dicom,
-            gt_idx=gt_idx,
-            ann_info=ann_info)
-
-        return self.pipeline(results)
-
-    def prepare_test_study(self, idx):
+    def prepare_test_img(self, idx):
         raise NotImplementedError
