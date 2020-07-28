@@ -10,6 +10,10 @@ import numpy as np
 
 DISC_PARTS = ('T11-T12', 'T12-L1', 'L1-L2', 'L2-L3', 'L3-L4', 'L4-L5', 'L5-S1')
 VERTEBRA_PARTS = ('L1', 'L2', 'L3', 'L4', 'L5')
+ANNS = {
+    'lumbar_train150': 'annotations/lumbar_train150_annotation.json',
+    'lumbar_train51': 'annotations/lumbar_train51_annotation.json',
+}
 
 
 def get_disc_id(tag):
@@ -46,30 +50,88 @@ def load_dicom_image(reader):
 
 
 def parse_meta(meta):
-    study_uid = meta['0020|000d']
-    series_uid = meta['0020|000e']
-    instance_uid = meta['0008|0018']
-    series_description = meta['0008|103e'].strip()
+    meta_keys = {
+        'study_uid': '0020|000d',
+        'series_uid': '0020|000e',
+        'instance_uid': '0008|0018',
+        'series_description': '0008|103e',
+        'image_position': '0020|0032',
+        'image_orientation': '0020|0037',
+        'slice_thickness': '0018|0050',
+        'pixel_spacing': '0028|0030',
+    }
 
-    meta_info = dict(
-        study_uid=study_uid,
-        series_uid=series_uid,
-        instance_uid=instance_uid,
-        serise_description=series_description)
-
-    keynames = [
-        'image_position', 'image_orientation', 'slice_thickness',
-        'pixel_spacing'
-    ]
-    meta_keys = ['0020|0032', '0020|0037', '0018|0050', '0028|0030']
-    for keyname, key in zip(keynames, meta_keys):
-        if key not in meta:
+    _meta = {}
+    for key, meta_key in meta_keys.items():
+        if meta_key not in meta:
             continue
-        value = meta[key].strip().split('\\')
-        value = list(map(float, value))
-        meta_info[keyname] = value
+        _meta[key] = meta[meta_key]
+    return _meta
 
-    return meta_info
+
+def get_all_dicoms(study, reader, study_id, dicom_id, img_prefix):
+    """
+    Args:
+        study (Path): study dir path.
+        reader (sitk.Reader): DICOM file reader.
+        study_id (int): 1-based study_id.
+        dicom_id (int): 1-based dicom_id.
+        img_prefix (Path): images dir path.
+
+    Returns:
+        study (dict): study annotations.
+            - id
+            - study_idx
+            - study_uid
+        dicom_list (list[dict]): dicom info list of the study.
+        dicom_id: dicom counter
+    """
+    # study_idx is the original dirname in dataset
+    study_idx = osp.basename(study)
+
+    dicoms = glob(osp.join(study, '*.dcm'))
+    dicom_list = []
+    for dicom in dicoms:
+        # read DICOM file
+        reader.SetFileName(dicom)
+        try:
+            reader.ReadImageInformation()
+        except RuntimeError:
+            continue
+
+        _dicom_dict = dict(id=dicom_id, study_id=study_id)
+        filename = osp.basename(dicom)
+        filename = filename.replace('.dcm', '.jpg')
+        filename = f'{study_idx}_{filename}'
+        _dicom_dict['filename'] = filename
+
+        meta = {
+            key: reader.GetMetaData(key)
+            for key in reader.GetMetaDataKeys()
+        }
+        _dicom_dict.update(parse_meta(meta))
+
+        # image height and width
+        img_path = osp.join(img_prefix, filename)
+        if osp.exists(img_path):
+            img = mmcv.imread(img_path)
+        else:
+            # no JPG img, convert DICOM to JPG
+            img = load_dicom_image(reader)
+            print(f'Writing {img_path}')
+            mmcv.imwrite(img, img_path)
+        height, width = img.shape[:2]
+        _dicom_dict['height'] = height
+        _dicom_dict['width'] = width
+
+        dicom_list.append(_dicom_dict)
+        dicom_id += 1
+
+    # study info
+    study_uid = dicom_list[-1]['study_uid']
+    study = dict(id=study_id, study_idx=study_idx, study_uid=study_uid)
+
+    return study, dicom_list, dicom_id
 
 
 def parse_args():
@@ -80,21 +142,17 @@ def parse_args():
         default='/data/tianchi-lumbar',
         help='path to Tianchi lumbar dataset')
     parser.add_argument(
-        '--img-prefix',
+        '--dicom-prefix',
         default='lumbar_train150',
         help='prefix of DICOM file (dirname)')
     parser.add_argument(
-        '--ann-file',
-        default='annotations/lumbar_train150_annotation.json',
-        help='annotation file')
+        '--img-prefix', default=None, help='path of converted JPG images')
+    parser.add_argument('--ann-file', default=None, help='annotation file')
     parser.add_argument(
         '--out-annfile',
-        default='annotations/lumbar_train150.json',
+        default=None,
         help='path to converted coco-style annotation file')
-    parser.add_argument(
-        '--out-dir',
-        default='train150',
-        help='path of output converted images')
+
     args = parser.parse_args()
 
     return args
@@ -104,22 +162,52 @@ def main():
     args = parse_args()
 
     data_root = args.data_root
-    img_prefix = osp.join(data_root, args.img_prefix)
-    ann_file = osp.join(data_root, args.ann_file)
-    out_annfile = osp.join(data_root, args.out_annfile)
-    out_dir = osp.join(data_root, args.out_dir)
+    dicom_prefix = osp.join(data_root, args.dicom_prefix)
+    print('This script is processing DICOM file dataset.')
+    print(f'DICOM files in: {dicom_prefix}')
 
+    with_anns = False
+    if args.ann_file is None:
+        if args.dicom_prefix in ANNS:
+            # use predefined ann_file
+            ann_file = ANNS[args.dicom_prefix]
+            ann_file = osp.join(data_root, ann_file)
+            print(f'Using pre-defined annotation file: {ann_file}')
+            with_anns = True
+        else:
+            print('Without specified annotation file, this script will '
+                  'generate ann_file without ground truths.')
+    else:
+        ann_file = osp.join(data_root, args.ann_file)
+        print(f'Using specified annotation file {ann_file}.')
+        with_anns = True
+
+    # output paths
+    if args.out_annfile is None:
+        # default: use ``annotations/{dicom_prefix``
+        out_annfile = f'annotations/{args.dicom_prefix}.json'
+    else:
+        out_annfile = args.out_annfile
+    out_annfile = osp.join(data_root, out_annfile)
+    # remove existing out_annfile
     if osp.exists(out_annfile):
         print(f'NOTE: {out_annfile} exists, it will be removed')
         os.remove(out_annfile)
 
-    # check the out_dir; without JPG images, this script will
-    # convert DICOM to JPG
-    mmcv.mkdir_or_exist(out_dir)
+    if args.img_prefix is None:
+        # default: use ``images/{dicom_prefix}``
+        img_prefix = f'images/{args.dicom_prefix}'
+    else:
+        img_prefix = args.img_prefix
+    img_prefix = osp.join(data_root, img_prefix)
+    print(f'Set img prefix to {img_prefix}')
+    # check the img_prefix dir; this script will convert DICOM to JPG
+    # if not existing
+    mmcv.mkdir_or_exist(img_prefix)
 
     # 1. first get all study dirnames
-    studies = glob(osp.join(img_prefix, 'study*'))
-    print(f'There are {len(studies)} study instances in {img_prefix}')
+    studies = glob(osp.join(dicom_prefix, 'study*'))
+    print(f'There are {len(studies)} study instances in {dicom_prefix}')
 
     # 2. set DICOM file reader
     reader = sitk.ImageFileReader()
@@ -133,51 +221,12 @@ def main():
     # it will be converted to list when writing new annotation files
     study_dict = defaultdict(dict)
     for i, study in enumerate(studies):
-        # study_idx is the original dirname in dataset
-        study_idx = osp.basename(study)
         # study_id starts from 1
         study_id = i + 1
+        study, _dicom_list, dicom_id = get_all_dicoms(study, reader, study_id,
+                                                      dicom_id, img_prefix)
 
-        dicoms = glob(osp.join(study, '*.dcm'))
-        _dicom_list = []
-        for dicom in dicoms:
-            reader.SetFileName(dicom)
-            try:
-                reader.ReadImageInformation()
-            except RuntimeError:
-                continue
-
-            _dicom_dict = dict(id=dicom_id, study_id=study_id)
-            filename = osp.basename(dicom)
-            filename = filename.replace('.dcm', '.jpg')
-            filename = f'{study_idx}_{filename}'
-            _dicom_dict['filename'] = filename
-
-            meta = {
-                key: reader.GetMetaData(key)
-                for key in reader.GetMetaDataKeys()
-            }
-            _dicom_dict.update(parse_meta(meta))
-
-            # image height and width
-            _filename = osp.join(out_dir, filename)
-            if osp.exists(_filename):
-                image = mmcv.imread(_filename)
-            else:
-                # no JPG image, convert DICOM to JPG
-                image = load_dicom_image(reader)
-                print(f'Writing {_filename}')
-                mmcv.imwrite(image, _filename)
-            height, width = image.shape[:2]
-            _dicom_dict['height'] = height
-            _dicom_dict['width'] = width
-
-            _dicom_list.append(_dicom_dict)
-            dicom_id += 1
-
-        study_uid = _dicom_list[-1]['study_uid']
-        study = dict(id=study_id, study_idx=study_idx, study_uid=study_uid)
-        study_dict[study_uid] = study
+        study_dict[study['study_uid']] = study
         dicom_list.extend(_dicom_list)
 
     # 4. get all categories
@@ -192,8 +241,7 @@ def main():
     ]
 
     # 5. get annotations if exists
-    if ann_file != 'none':
-        print(f'Ground-truth annotation file {ann_file} exists.')
+    if with_anns:
         print(f'Converting original annotations to {out_annfile}')
 
         ori_anns = mmcv.load(ann_file)
@@ -259,12 +307,12 @@ def main():
             ann_list.extend(_ann_list)
 
     # 6. write to out_annfile
-    study_list = [study for uid, study in study_dict.items()]
+    study_list = [study for _, study in study_dict.items()]
     coco_style_ann = dict(
         studies=study_list, dicoms=dicom_list, categories=categories)
-    if ann_list != 'none':
+    if with_anns:
         coco_style_ann['annotations'] = ann_list
-    print(f'Writing annotations to {out_annfile}')
+    print(f'Writing {out_annfile}')
     mmcv.dump(coco_style_ann, out_annfile)
 
 
