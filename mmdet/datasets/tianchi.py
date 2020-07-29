@@ -185,9 +185,17 @@ class TianchiImageDataset(CocoDataset):
         data_info = self.data_infos[idx]
         ann_info = self.get_ann_info(idx)
         results = dict(img_info=data_info, ann_info=ann_info)
-        # self.pre_pipeline(results)
-        # return self.pipeline(results)
-        return results
+        self.pre_pipeline(results)
+
+        return self.pipeline(results)
 
     def prepare_test_img(self, idx):
-        raise NotImplementedError
+        data_info = self.data_infos[idx]
+        results = dict(img_info=data_info)
+        self.pre_pipeline(results)
+
+        return self.pipeline(results)
+
+    def pre_pipeline(self, results):
+        super().pre_pipeline(results)
+        results['point_fields'] = []

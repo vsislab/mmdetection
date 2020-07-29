@@ -2,47 +2,55 @@ import mmcv
 import numpy as np
 from mmcv.parallel import DataContainer as DC
 
-from .formating import to_tensor
 from ..builder import PIPELINES
+from .formating import DefaultFormatBundle, to_tensor
+from .loading import LoadAnnotations
+from .transforms import Resize, RandomFlip
 
 
 @PIPELINES.register_module()
-class TianchiLoadAnnotation(object):
+class TianchiLoadAnnotation(LoadAnnotations):
 
     def __init__(self,
-                 with_valid=False,
-                 with_points=True,
-                 with_bboxes=False,
-                 with_labels=True):
-        self.with_valid = with_valid
-        self.with_points = with_points
-        self.with_bboxes = with_bboxes
-        self.with_labels = with_labels
+                 with_point=True,
+                 with_bbox=True,
+                 with_label=True,
+                 with_part_inds=True):
+        super().__init__(with_bbox, with_label)
+        self.with_point = with_point
+        self.with_part_inds = with_part_inds
+
+    def _load_points(self, results):
+        """Private function to load point annotations.
+
+        Args:
+            results (dict): Result dict from :obj:`mmdet.CustomDataset`.
+
+        Returns:
+            dict: The dict contains loaded bounding box annotations.
+        """
+
+        ann_info = results['ann_info']
+        results['gt_points'] = ann_info['points'].copy()
+        results['point_fields'].append('gt_points')
+        if self.with_part_inds:
+            results['part_inds'] = results['ann_info']['part_insd'].copy()
+        return results
 
     def __call__(self, results):
-        ann_info = results['ann_info']
-        if self.with_valid:
-            results['valid'] = ann_info['valid'].copy()
-        if self.with_points:
-            results['gt_points'] = ann_info['points'].copy()
-        if self.with_bboxes:
-            results['gt_bboxes'] = ann_info['bboxes'].copy()
-        if self.with_labels:
-            results['gt_labels'] = ann_info['labels'].copy()
+        results = super().__call__(results)
+        if self.with_point:
+            results = self._load_points
 
         return results
 
 
 @PIPELINES.register_module()
-class TianchiFormatBundle(object):
+class TianchiFormatBundle(DefaultFormatBundle):
 
     def __call__(self, results):
-        img = results['img']
-        if len(img.shape) < 3:
-            img = np.expand_dims(img, -1)
-        img = np.ascontiguousarray(img.transpose(2, 0, 1))
-        results['img'] = DC(to_tensor(img), stack=True)
-        for key in ['gt_points', 'gt_labels', 'valid']:
+        results = super().__call__(results)
+        for key in ['gt_points', 'part_inds']:
             if key not in results:
                 continue
             results[key] = DC(to_tensor(results[key]))
@@ -51,74 +59,80 @@ class TianchiFormatBundle(object):
 
 
 @PIPELINES.register_module()
-class TianchiResize(object):
-
-    def __init__(self, img_scale=None, keep_ratio=True):
-        self.img_scale = img_scale
-        self.keep_ratio = keep_ratio
-
-    def _resize_imgs(self, results):
-        img = results['img']
-
-        if self.keep_ratio:
-            img, scale_factor = mmcv.imrescale(
-                img, self.img_scale, return_scale=True)
-            new_h, new_w = img.shape[:2]
-            h, w = results['img'].shape[:2]
-            w_scale = new_w / w
-            h_scale = new_h / h
-        else:
-            img, w_scale, h_scale = mmcv.imresize(
-                img, self.img_scale, return_scale=True)
-
-        results['img'] = img
-        scale_factor = np.array([w_scale, h_scale], dtype=np.float32)
-
-        results['img_shape'] = img.shape
-        # in case that there is no padding
-        results['pad_shape'] = img.shape
-        results['scale_factor'] = scale_factor
-        results['keep_ratio'] = self.keep_ratio
+class TianchiResize(Resize):
 
     def _resize_points(self, results):
         """Resize points with ``results['scale_factor']``."""
         img_shape = results['img_shape']
-        points = results['gt_points'] * results['scale_factor']
-        points[:, 0] = np.clip(points[:, 0], 0, img_shape[1])
-        points[:, 1] = np.clip(points[:, 1], 0, img_shape[0])
-
-        results['gt_points'] = points
+        for key in results.get('point_fields', []):
+            points = results[key] * results['scale_factor']
+            points[:, 0] = np.clip(points[:, 0], 0, img_shape[1])
+            points[:, 1] = np.clip(points[:, 1], 0, img_shape[0])
+            results[key] = points
 
     def __call__(self, results):
-        self._resize_imgs(results)
-        self._resize_points(results)
+        results = super().__call__(results)
+        results = self._resize_points(results)
 
         return results
 
-    def __repr__(self):
-        repr_str = self.__class__.__name__
-        repr_str += f'(img_scale={self.img_scale},'
-        repr_str += f' keep_ratio={self.keep_ratio})'
 
-        return repr_str
+@PIPELINES.register_module()
+class TianchiRandomFlip(RandomFlip):
+    """Flip the image & point.
+    """
+
+    def point_flip(self, points, img_shape, direction):
+        """Flip points.
+        """
+
+        assert points.shape[-1] == 2
+        flipped = points.copy()
+        if direction == 'horizontal':
+            w = img_shape[1]
+            flipped[..., 0] = w - points[..., 0]
+        elif direction == 'vertical':
+            h = img_shape[0]
+            flipped[..., 1] = h - points[..., 1]
+        else:
+            raise ValueError(f"Invalid flipping direction '{direction}'")
+
+        return flipped
+
+    def __call__(self, results):
+        results = super().__call__(results)
+        if results['flip']:
+            # flip points
+            for key in results.get('point_fields', []):
+                results[key] = self.point_flip(results[key],
+                                               results['img_shape'],
+                                               results['flip_direction'])
+        return results
 
 
 @PIPELINES.register_module()
-class TianchiPad(object):
+class TianchiVisual(object):
 
-    def __init__(self, size=None, pad_val=0):
-        self.size = size
-        self.pad_val = pad_val
+    def __init__(self, with_gt=True, out_prefix='work_dirs/visualizations/'):
+        self.with_gt = with_gt
+        self.out_prefix = out_prefix
 
-    def _pad_img(self, results):
-        if self.size is not None:
-            padded_img = mmcv.impad(
-                results['img'], shape=self.size, pad_val=self.pad_val)
+    def __call__(self, results):
+        import cv2
+        img = np.ascontiguousarray(results['img'])
 
-            results['img'] = padded_img
-            results['pad_shape'] = padded_img.shape
+        if self.with_gt:
+            points = results['gt_points']
+            bboxes = results['gt_bboxes']
 
-    def __call__(self, resutls):
-        self._pad_img(resutls)
+            for i in range(points.shape[0]):
+                point = tuple(map(int, points[i]))
+                bbox = tuple(map(int, bboxes[i]))
+                img = cv2.circle(img, point, 2, mmcv.color_val('red'))
+                img = cv2.rectangle(img, bbox[:2], bbox[2:],
+                                    mmcv.color_val('green'))
 
-        return resutls
+        filename = self.out_prefix + results['ori_filename']
+        mmcv.imwrite(img, filename)
+
+        return results
